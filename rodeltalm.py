@@ -32,7 +32,8 @@ from fairseq.modules.rotary_positional_embedding import (
     apply_rotary_pos_emb,
 )
 from fairseq.modules.transformer_layer import (
-    TransformerEncoderLayerBase
+    TransformerEncoderLayerBase,
+    TransformerEncoderLayer
 )
 from fairseq.modules.espnet_multihead_attention import (
     RotaryPositionMultiHeadedAttention
@@ -140,38 +141,46 @@ class RoDeltaLMEncoder(TransformerEncoderBase):
                 pretrained_deltalm_checkpoint=args.pretrained_deltalm_checkpoint,
                 is_encoder=True,
             )
-            self.load_state_dict(deltalm_loaded_state_dict, strict=True)
+            self.load_state_dict(deltalm_loaded_state_dict, strict=False)
             logger.info("Load RoDeltaLM's encoder from {0}".format(args.pretrained_deltalm_checkpoint))
         self.embed_positions = None
-    def build_decoder_layer(self, args, no_encoder_attn=False):
+
+    def build_encoder_layer(self, args, no_encoder_attn=False):
         layer = RoDeltaLMEncoderLayer(args, no_encoder_attn)
         if getattr(args, "checkpoint_activations", False):
             layer = checkpoint_wrapper(layer)
         return layer
 
 
-class RoDeltaLMEncoderLayer(TransformerEncoderLayerBase):
+class RoDeltaLMEncoderLayer(TransformerEncoderLayer):
     def __init__(
             self, cfg, return_fc=False
     ):
-        super(TransformerEncoderLayerBase, self).__init__()
-
-        # # 
-        # self.embed_positions = {
-        #     RotaryPositionalEmbedding(
-        #         self.embed_dim,
-        #         base=10000,
-        #         precision=torch.float32
-        #     )
-        # }
+        super(TransformerEncoderLayer, self).__init__(
+            cfg,
+            return_fc
+        )
+        self.rotary_self_attention = RotaryPositionMultiHeadedAttention(
+            self.embed_dim,
+            self.encoder_attention_heads,
+            self.dropout,
+            precision=torch.float32,
+            rotary_emd_base=10000
+        )
 
     def build_self_attention(self, embed_dim, cfg):
-        return RotaryPositionMultiHeadedAttention(
+        self.embed_dim = embed_dim
+        self.encoder_attention_heads = cfg.encoder.attention_heads
+        self.dropout = cfg.attention_dropout
+        return MultiheadAttention(
             embed_dim,
             cfg.encoder.attention_heads,
             dropout=cfg.attention_dropout,
-            precision=torch.float32,
-            rotary_emd_base=10000)
+            self_attention=True,
+            q_noise=self.quant_noise,
+            qn_block_size=self.quant_noise_block_size,
+            xformers_att_config=cfg.encoder.xformers_att_config,
+        )
     
     def forward(
         self,
@@ -185,19 +194,12 @@ class RoDeltaLMEncoderLayer(TransformerEncoderLayerBase):
                 attn_mask.to(torch.bool), -1e8 if x.dtype == torch.float32 else -1e4
             )
 
-        # # Apply Rotary Positional Embedding ==========
-        # cos_embed, sin_embed = self.embed_positions(x)
-        # q, k = apply_rotary_pos_emb(
-        #     q=x, k=x, cos=cos_embed, sin=sin_embed
-        # )
-        # # ============================================
-        
 
         residual = x
         if self.normalize_before:
             x = self.self_attn_layer_norm(x)
 
-        x, _ = self.self_attn(
+        x, _ = self.rotary_self_attention(
             query=x,
             key=x,
             value=x,
@@ -239,8 +241,9 @@ class RoDeltaLMDecoder(TransformerDecoderBase):
                 pretrained_deltalm_checkpoint=args.pretrained_deltalm_checkpoint,
                 is_encoder=False,
             )
-            self.load_state_dict(deltalm_loaded_state_dict, strict=True)
+            self.load_state_dict(deltalm_loaded_state_dict, strict=False)
             logger.info("Load RoDeltaLM's decoder from {0}".format(args.pretrained_deltalm_checkpoint))
+        self.embed_positions = None
 
     def build_decoder_layer(self, args, no_encoder_attn=False):
         layer = RoDeltaLMDecoderLayer(args, no_encoder_attn)
@@ -330,13 +333,14 @@ class RoDeltaLMDecoderLayer(TransformerDecoderLayerBase):
 
         self.onnx_trace = False
     
-    # def build_self_attention(self, embed_dim, cfg, add_bias_kv=False, add_zero_attn=False):
-    #     return RotaryPositionMultiHeadedAttention(
-    #         embed_dim,
-    #         cfg.decoder.attention_heads,
-    #         cfg.attention_dropout,
-    #         precision=torch.float32,
-    #     )
+    def build_self_attention(self, embed_dim, cfg, add_bias_kv=False, add_zero_attn=False):
+        return RotaryPositionMultiHeadedAttention(
+            embed_dim,
+            cfg.decoder.attention_heads,
+            cfg.attention_dropout,
+            precision=torch.float32,
+        )
+    
     # def build_encoder_attention(self, embed_dim, cfg):
     #     return RotaryPositionMultiHeadedAttention(
     #         embed_dim,
@@ -382,22 +386,18 @@ class RoDeltaLMDecoderLayer(TransformerDecoderLayerBase):
         residual = x
         if self.normalize_before:
             x = self.self_attn_layer_norm(x)
-        if prev_self_attn_state is not None:
-            prev_key, prev_value = prev_self_attn_state[:2]
-            saved_state: Dict[str, Optional[Tensor]] = {
-                "prev_key": prev_key,
-                "prev_value": prev_value,
-            }
-            if len(prev_self_attn_state) >= 3:
-                saved_state["prev_key_padding_mask"] = prev_self_attn_state[2]
-            assert incremental_state is not None
-            self.self_attn._set_input_buffer(incremental_state, saved_state)
-        _self_attn_input_buffer = self.self_attn._get_input_buffer(incremental_state)
-        if self.cross_self_attention and not (
-            incremental_state is not None
-            and _self_attn_input_buffer is not None
-            and "prev_key" in _self_attn_input_buffer
-        ):
+        # if prev_self_attn_state is not None:
+        #     prev_key, prev_value = prev_self_attn_state[:2]
+        #     saved_state: Dict[str, Optional[Tensor]] = {
+        #         "prev_key": prev_key,
+        #         "prev_value": prev_value,
+        #     }
+        #     if len(prev_self_attn_state) >= 3:
+        #         saved_state["prev_key_padding_mask"] = prev_self_attn_state[2]
+        #     assert incremental_state is not None
+        #     self.self_attn._set_input_buffer(incremental_state, saved_state)
+        # _self_attn_input_buffer = self.self_attn._get_input_buffer(incremental_state)
+        if self.cross_self_attention:
             if self_attn_mask is not None:
                 assert encoder_out is not None
                 self_attn_mask = torch.cat(
