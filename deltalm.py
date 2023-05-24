@@ -1,4 +1,7 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
 
 import os
 from typing import Any, Dict, List, Optional, Tuple
@@ -30,6 +33,9 @@ from fairseq.modules.rotary_positional_embedding import (
 )
 from fairseq.modules.transformer_layer import (
     TransformerEncoderLayerBase
+)
+from fairseq.modules.espnet_multihead_attention import (
+    RotaryPositionMultiHeadedAttention
 )
 ##############################################################################
 from fairseq.modules.multihead_attention import MultiheadAttention
@@ -79,15 +85,24 @@ def upgrade_state_dict_for_deltalm(
         map_key = map_key.replace('.ffn.', '.')
         map_key = map_key.replace('emb_layer_norm', 'layernorm_embedding')
         # assert map_key in state_dict, map_key
-        # if 'embed_positions' in key or 'embed_tokens' in key:
-        #     left_size = state_dict[map_key].size(0)
-        #     right_size = deltalm_state_dict[key].size(0)
-        #     if left_size <= right_size:
-        #         state_dict[map_key] = deltalm_state_dict[key][:left_size]
-        #     else:
-        #         state_dict[map_key][:right_size] = deltalm_state_dict[key]
-        # else:
-        #     state_dict[map_key] = deltalm_state_dict[key]
+        if 'embed_positions' in key or 'embed_tokens' in key:
+            try:
+                left_size = state_dict[map_key].size(0)
+            except:
+                print(f"[WARNING] left_size = {map_key} not found")
+            try: 
+                right_size = deltalm_state_dict[key].size(0)
+            except:
+                print(f"[WARNING] left_size = {key} not found")
+            if left_size <= right_size:
+                state_dict[map_key] = deltalm_state_dict[key][:left_size]
+            else:
+                try:
+                    state_dict[map_key][:right_size] = deltalm_state_dict[key]
+                except:
+                    print(f"[WARNING] {map_key} not found")
+        else:
+            state_dict[map_key] = deltalm_state_dict[key]
 
     return state_dict
 
@@ -127,6 +142,7 @@ class RoDeltaLMEncoder(TransformerEncoderBase):
             )
             self.load_state_dict(deltalm_loaded_state_dict, strict=True)
             logger.info("Load RoDeltaLM's encoder from {0}".format(args.pretrained_deltalm_checkpoint))
+        self.embed_positions = None
     def build_decoder_layer(self, args, no_encoder_attn=False):
         layer = RoDeltaLMEncoderLayer(args, no_encoder_attn)
         if getattr(args, "checkpoint_activations", False):
@@ -140,13 +156,22 @@ class RoDeltaLMEncoderLayer(TransformerEncoderLayerBase):
     ):
         super(TransformerEncoderLayerBase, self).__init__()
 
-        # 
-        self.embed_positions = {
-            RotaryPositionalEmbedding(
-                self.embed_dim,
-                base=10000,
-            )
-        }
+        # # 
+        # self.embed_positions = {
+        #     RotaryPositionalEmbedding(
+        #         self.embed_dim,
+        #         base=10000,
+        #         precision=torch.float32
+        #     )
+        # }
+
+    def build_self_attention(self, embed_dim, cfg):
+        return RotaryPositionMultiHeadedAttention(
+            embed_dim,
+            cfg.encoder.attention_heads,
+            dropout=cfg.attention_dropout,
+            precision=torch.float32,
+            rotary_emd_base=10000)
     
     def forward(
         self,
@@ -160,20 +185,21 @@ class RoDeltaLMEncoderLayer(TransformerEncoderLayerBase):
                 attn_mask.to(torch.bool), -1e8 if x.dtype == torch.float32 else -1e4
             )
 
-        # Apply Rotary Positional Embedding ==========
-        cos_embed, sin_embed = self.embed_positions(x)
-        q, k = apply_rotary_pos_emb(
-            q=x, k=x, cos=cos_embed, sin=sin_embed
-        )
-        # ============================================
+        # # Apply Rotary Positional Embedding ==========
+        # cos_embed, sin_embed = self.embed_positions(x)
+        # q, k = apply_rotary_pos_emb(
+        #     q=x, k=x, cos=cos_embed, sin=sin_embed
+        # )
+        # # ============================================
         
 
         residual = x
         if self.normalize_before:
             x = self.self_attn_layer_norm(x)
+
         x, _ = self.self_attn(
-            query=q,
-            key=k,
+            query=x,
+            key=x,
             value=x,
             key_padding_mask=encoder_padding_mask,
             need_weights=False,
@@ -303,6 +329,21 @@ class RoDeltaLMDecoderLayer(TransformerDecoderLayerBase):
         self.need_attn = True
 
         self.onnx_trace = False
+    
+    # def build_self_attention(self, embed_dim, cfg, add_bias_kv=False, add_zero_attn=False):
+    #     return RotaryPositionMultiHeadedAttention(
+    #         embed_dim,
+    #         cfg.decoder.attention_heads,
+    #         cfg.attention_dropout,
+    #         precision=torch.float32,
+    #     )
+    # def build_encoder_attention(self, embed_dim, cfg):
+    #     return RotaryPositionMultiHeadedAttention(
+    #         embed_dim,
+    #         cfg.decoder.attention_heads,
+    #         dropout=cfg.attention_dropout,
+    #         precision=torch.float32
+    #     )
 
 
     def forward(
