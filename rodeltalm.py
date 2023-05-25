@@ -25,7 +25,6 @@ from fairseq.models.transformer.transformer_config import (
 from fairseq.modules.transformer_layer import (
     TransformerDecoderLayerBase
 )
-##############################################################################
 from fairseq.modules.rotary_positional_embedding import (
     RotaryPositionalEmbedding,
     rotate_half,
@@ -38,7 +37,6 @@ from fairseq.modules.transformer_layer import (
 from fairseq.modules.espnet_multihead_attention import (
     RotaryPositionMultiHeadedAttention
 )
-##############################################################################
 from fairseq.modules.multihead_attention import MultiheadAttention
 from fairseq.modules import LayerNorm
 from fairseq.modules.fairseq_dropout import FairseqDropout
@@ -61,6 +59,9 @@ def upgrade_state_dict_for_deltalm(
     with open(pretrained_deltalm_checkpoint, "rb") as f:
         state = torch.load(f, map_location=torch.device("cpu"))
     deltalm_state_dict = state["weights"]
+    for key in deltalm_state_dict:
+        print(key + "   " + str(deltalm_state_dict[key].size()))
+        pass
 
     new_deltalm_state_dict = {}
 
@@ -84,6 +85,12 @@ def upgrade_state_dict_for_deltalm(
         map_key = map_key.replace('.ffn_1.fc2', '.fc4')
         map_key = map_key.replace('.ffn_2', '')
         map_key = map_key.replace('.ffn.', '.')
+
+        map_key = map_key.replace('.self_attn.q_proj.', '.rotary_self_attn.linear_q.')
+        map_key = map_key.replace('.self_attn.k_proj.', '.rotary_self_attn.linear_k.')
+        map_key = map_key.replace('.self_attn.v_proj.', '.rotary_self_attn.linear_v.')
+        map_key = map_key.replace('.self_attn.out_proj.', '.rotary_self_attn.linear_out.')
+
         map_key = map_key.replace('emb_layer_norm', 'layernorm_embedding')
         # assert map_key in state_dict, map_key
         if 'embed_positions' in key or 'embed_tokens' in key:
@@ -104,11 +111,14 @@ def upgrade_state_dict_for_deltalm(
                     print(f"[WARNING] {map_key} not found")
         else:
             state_dict[map_key] = deltalm_state_dict[key]
+    
+    for key in state_dict:
+        print(key + "\t\t\t\t\t\tin state_dict")
 
     return state_dict
 
 
-@register_model("deltalm")
+@register_model("rodeltalm")
 class RoDeltaLMModel(TransformerModel):
 
     @staticmethod
@@ -129,9 +139,6 @@ class RoDeltaLMModel(TransformerModel):
     def build_decoder(cls, args, tgt_dict, embed_tokens):
         return RoDeltaLMDecoder(TransformerConfig.from_namespace(args), tgt_dict, embed_tokens)
 
-
-##############################################################################
-##############################################
 class RoDeltaLMEncoder(TransformerEncoderBase):
     def __init__(self, args, dictionary, embed_tokens):
         super().__init__(args, dictionary, embed_tokens)
@@ -141,9 +148,10 @@ class RoDeltaLMEncoder(TransformerEncoderBase):
                 pretrained_deltalm_checkpoint=args.pretrained_deltalm_checkpoint,
                 is_encoder=True,
             )
-            self.load_state_dict(deltalm_loaded_state_dict, strict=False)
+            self.load_state_dict(deltalm_loaded_state_dict, strict=True)
             logger.info("Load RoDeltaLM's encoder from {0}".format(args.pretrained_deltalm_checkpoint))
         self.embed_positions = None
+
 
     def build_encoder_layer(self, args, no_encoder_attn=False):
         layer = RoDeltaLMEncoderLayer(args, no_encoder_attn)
@@ -160,7 +168,7 @@ class RoDeltaLMEncoderLayer(TransformerEncoderLayer):
             cfg,
             return_fc
         )
-        self.rotary_self_attention = RotaryPositionMultiHeadedAttention(
+        self.rotary_self_attn = RotaryPositionMultiHeadedAttention(
             self.embed_dim,
             self.encoder_attention_heads,
             self.dropout,
@@ -199,7 +207,7 @@ class RoDeltaLMEncoderLayer(TransformerEncoderLayer):
         if self.normalize_before:
             x = self.self_attn_layer_norm(x)
 
-        x, _ = self.rotary_self_attention(
+        x, _ = self.rotary_self_attn(
             query=x,
             key=x,
             value=x,
@@ -241,7 +249,11 @@ class RoDeltaLMDecoder(TransformerDecoderBase):
                 pretrained_deltalm_checkpoint=args.pretrained_deltalm_checkpoint,
                 is_encoder=False,
             )
-            self.load_state_dict(deltalm_loaded_state_dict, strict=False)
+            print("[DECODER] keys")
+            for key in self.state_dict().keys():
+                print(key + "\t\t\t\tin decoder")
+
+            self.load_state_dict(deltalm_loaded_state_dict, strict=True)
             logger.info("Load RoDeltaLM's decoder from {0}".format(args.pretrained_deltalm_checkpoint))
         self.embed_positions = None
 
@@ -272,6 +284,14 @@ class RoDeltaLMDecoderLayer(TransformerDecoderLayerBase):
             args,
             add_bias_kv=add_bias_kv,
             add_zero_attn=add_zero_attn,
+        )
+
+        self.rotary_self_attn = RotaryPositionMultiHeadedAttention(
+            self.embed_dim,
+            args.decoder.attention_heads,
+            args.dropout,
+            precision=torch.float32,
+            rotary_emd_base=10000
         )
 
         self.activation_fn = utils.get_activation_fn(
@@ -417,7 +437,7 @@ class RoDeltaLMDecoderLayer(TransformerDecoderLayerBase):
         else:
             y = x
 
-        x, attn = self.self_attn(
+        x, attn = self.rotary_self_attn(
             query=x,
             key=y,
             value=y,
@@ -506,7 +526,7 @@ class RoDeltaLMDecoderLayer(TransformerDecoderLayerBase):
 
 
 @register_model_architecture(
-    "deltalm", "deltalm_base"
+    "rodeltalm", "rodeltalm_base"
 )
 def base_architecture(args):
     args.encoder_embed_dim = 768
@@ -528,7 +548,7 @@ def base_architecture(args):
 
 
 @register_model_architecture(
-    "deltalm", "deltalm_large"
+    "rodeltalm", "rodeltalm_large"
 )
 def large_architecture(args):
     base_architecture(args)
