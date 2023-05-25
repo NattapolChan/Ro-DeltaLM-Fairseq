@@ -59,9 +59,6 @@ def upgrade_state_dict_for_deltalm(
     with open(pretrained_deltalm_checkpoint, "rb") as f:
         state = torch.load(f, map_location=torch.device("cpu"))
     deltalm_state_dict = state["weights"]
-    for key in deltalm_state_dict:
-        print(key + "   " + str(deltalm_state_dict[key].size()))
-        pass
 
     new_deltalm_state_dict = {}
 
@@ -111,9 +108,6 @@ def upgrade_state_dict_for_deltalm(
                     print(f"[WARNING] {map_key} not found")
         else:
             state_dict[map_key] = deltalm_state_dict[key]
-    
-    for key in state_dict:
-        print(key + "\t\t\t\t\t\tin state_dict")
 
     return state_dict
 
@@ -237,8 +231,6 @@ class RoDeltaLMEncoderLayer(TransformerEncoderLayer):
         if self.return_fc and not torch.jit.is_scripting():
             return x, fc_result
         return x
-##############################################
-##############################################################################
 
 class RoDeltaLMDecoder(TransformerDecoderBase):
     def __init__(self, args, dictionary, embed_tokens, no_encoder_attn=False):
@@ -249,9 +241,6 @@ class RoDeltaLMDecoder(TransformerDecoderBase):
                 pretrained_deltalm_checkpoint=args.pretrained_deltalm_checkpoint,
                 is_encoder=False,
             )
-            print("[DECODER] keys")
-            for key in self.state_dict().keys():
-                print(key + "\t\t\t\tin decoder")
 
             self.load_state_dict(deltalm_loaded_state_dict, strict=True)
             logger.info("Load RoDeltaLM's decoder from {0}".format(args.pretrained_deltalm_checkpoint))
@@ -406,17 +395,7 @@ class RoDeltaLMDecoderLayer(TransformerDecoderLayerBase):
         residual = x
         if self.normalize_before:
             x = self.self_attn_layer_norm(x)
-        # if prev_self_attn_state is not None:
-        #     prev_key, prev_value = prev_self_attn_state[:2]
-        #     saved_state: Dict[str, Optional[Tensor]] = {
-        #         "prev_key": prev_key,
-        #         "prev_value": prev_value,
-        #     }
-        #     if len(prev_self_attn_state) >= 3:
-        #         saved_state["prev_key_padding_mask"] = prev_self_attn_state[2]
-        #     assert incremental_state is not None
-        #     self.self_attn._set_input_buffer(incremental_state, saved_state)
-        # _self_attn_input_buffer = self.self_attn._get_input_buffer(incremental_state)
+
         if self.cross_self_attention:
             if self_attn_mask is not None:
                 assert encoder_out is not None
@@ -450,8 +429,6 @@ class RoDeltaLMDecoderLayer(TransformerDecoderLayerBase):
         x = self.residual_connection(x, residual)
         if not self.normalize_before:
             x = self.self_attn_layer_norm(x)
-        
-        ###############################################
 
         residual = x
         if self.normalize_before:
@@ -497,7 +474,6 @@ class RoDeltaLMDecoderLayer(TransformerDecoderLayerBase):
             if not self.normalize_before:
                 x = self.encoder_attn_layer_norm(x)
 
-        ###############################################
         residual = x
         if self.normalize_before:
             x = self.final_layer_norm(x)
